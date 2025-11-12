@@ -27,7 +27,7 @@ public class FaceVerifier {
 
     // Model-specific configuration
     private static final int INPUT_IMAGE_SIZE = 112; // The model expects 112x112 pixel images
-    private static final int EMBEDDING_SIZE = 128;   // The model outputs a 128-float embedding vector
+    private static final int EMBEDDING_SIZE = 192;   // FIXED: Changed from 128 to 192 to match the downloaded model's output.
     private static final int BYTES_PER_CHANNEL = 4;  // Float size
 
     private final Interpreter tflite;
@@ -47,7 +47,7 @@ public class FaceVerifier {
      * Generates a facial embedding from a given Bitmap.
      *
      * @param bitmap The input image, which should contain a cropped face.
-     * @return A float array of size 128 representing the facial embedding.
+     * @return A float array of size 192 representing the facial embedding.
      */
     public float[] getFaceEmbedding(Bitmap bitmap) {
         // 1. Pre-process the image: resize and convert to ByteBuffer
@@ -134,4 +134,4 @@ public class FaceVerifier {
         }
         return byteBuffer;
     }
-            }
+}
