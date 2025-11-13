@@ -68,5 +68,7 @@
     <string name="kyc_instructions_id">Position your ID card inside the frame.</string>
     <string name="kyc_instructions_face">Now, position your face in the frame.</string>
     <string name="kyc_status_verifying">Verifying...</string>
+    <!-- THIS IS THE MISSING STRING THAT CAUSED THE BUILD ERROR -->
+    <string name="face_guide_box">Face guide box</string>
 
 </resources>
