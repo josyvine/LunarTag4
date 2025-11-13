@@ -25,6 +25,7 @@ import com.google.common.util.concurrent.ListenableFuture;
 import com.google.firebase.auth.FirebaseAuth;
 import com.google.firebase.auth.FirebaseUser;
 import com.google.firebase.firestore.FirebaseFirestore;
+import com.google.firebase.firestore.SetOptions;
 import com.google.mlkit.vision.common.InputImage;
 import com.google.mlkit.vision.face.Face;
 import com.google.mlkit.vision.face.FaceDetection;
@@ -72,10 +73,8 @@ public class KycActivity extends AppCompatActivity {
     private volatile KycState currentState = KycState.SCANNING_ID;
     private float[] idCardEmbedding = null;
     private String verifiedName = null;
-    
-    // --- FIX START: Use a thread-safe boolean to prevent race conditions ---
+
     private final AtomicBoolean isProcessing = new AtomicBoolean(false);
-    // --- FIX END ---
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -133,34 +132,37 @@ public class KycActivity extends AppCompatActivity {
         } catch (Exception e) {
             Log.e(TAG, "Use case binding failed", e);
         }
-        
+
+        // The ID in your XML is 'camera_preview', which ViewBinding converts to 'cameraPreview'. This is correct.
         preview.setSurfaceProvider(binding.cameraPreview.getSurfaceProvider());
     }
 
-    // --- FIX START: Create a dedicated method to handle the state transition cleanly ---
     private void proceedToFaceScan() {
         Log.d(TAG, "Proceeding to face scan.");
         currentState = KycState.SCANNING_FACE;
         updateUIForState();
     }
-    // --- FIX END ---
 
     private void updateUIForState() {
         runOnUiThread(() -> {
             switch (currentState) {
                 case SCANNING_ID:
+                    binding.guideBox.setVisibility(View.VISIBLE);
                     binding.textInstructions.setText(R.string.kyc_instructions_id);
                     break;
                 case SCANNING_FACE:
+                    binding.guideBox.setVisibility(View.VISIBLE);
                     binding.textInstructions.setText(R.string.kyc_instructions_face);
                     // This call will now safely rebind the camera to the front lens.
                     bindCameraUseCases();
                     break;
                 case VERIFYING:
+                    binding.guideBox.setVisibility(View.VISIBLE);
                     binding.textInstructions.setText(R.string.kyc_status_verifying);
                     binding.progressBar.setVisibility(View.VISIBLE);
                     break;
                 case COMPLETE:
+                    binding.guideBox.setVisibility(View.GONE);
                     binding.progressBar.setVisibility(View.GONE);
                     break;
             }
@@ -185,7 +187,7 @@ public class KycActivity extends AppCompatActivity {
                 imageProxy.close();
                 return;
             }
-            
+
             Image mediaImage = imageProxy.getImage();
             if (mediaImage == null) {
                 imageProxy.close();
@@ -226,13 +228,11 @@ public class KycActivity extends AppCompatActivity {
                     }
 
                     if (verifiedName != null && idCardEmbedding != null) {
-                        // --- FIX START: Safely trigger the state change ---
                         // Use compareAndSet to ensure this block runs only ONCE.
                         if (isProcessing.compareAndSet(false, true)) {
                             // Post the action to the main thread and let it handle the camera logic.
                             runOnUiThread(() -> proceedToFaceScan());
                         }
-                        // --- FIX END ---
                     }
                 });
         }
@@ -240,6 +240,7 @@ public class KycActivity extends AppCompatActivity {
         private Task<List<Face>> processLiveFaceImage(InputImage image, ImageProxy imageProxy) {
             return faceDetector.process(image)
                 .addOnSuccessListener(faces -> {
+                    // isProcessing is true here. compareAndSet to false to prevent re-entry.
                     if (!faces.isEmpty() && isProcessing.compareAndSet(true, false)) {
                         currentState = KycState.VERIFYING;
                         updateUIForState();
@@ -286,8 +287,10 @@ public class KycActivity extends AppCompatActivity {
             Map<String, Object> userData = new HashMap<>();
             userData.put("isVerified", true);
             userData.put("verifiedName", verifiedName);
+            // Use set with merge to create the document if it doesn't exist, or update it if it does.
+            // This is safer than using update(), which can fail if the document doesn't exist yet.
             FirebaseFirestore.getInstance().collection("users").document(user.getUid())
-                    .update(userData)
+                    .set(userData, SetOptions.merge())
                     .addOnSuccessListener(aVoid -> {
                         Toast.makeText(KycActivity.this, "Verification successful!", Toast.LENGTH_LONG).show();
                         finish();
@@ -297,7 +300,7 @@ public class KycActivity extends AppCompatActivity {
                          finish();
                      });
         } else {
-             Toast.makeText(this, "Verification successful, but no user found.", Toast.LENGTH_LONG).show();
+             Toast.makeText(this, "Verification successful, but no signed-in user found.", Toast.LENGTH_LONG).show();
              finish();
         }
     }
