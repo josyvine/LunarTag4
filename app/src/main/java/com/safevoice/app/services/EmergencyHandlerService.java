@@ -74,36 +74,45 @@ public class EmergencyHandlerService extends Service implements WebRTCManager.We
         return START_NOT_STICKY;
     }
 
+    // --- THIS IS THE UPDATED METHOD ---
     private void executeEmergencyActions(Location location) {
         ContactsManager contactsManager = ContactsManager.getInstance(this);
         Contact primaryContact = contactsManager.getPrimaryContact();
         List<Contact> priorityContacts = contactsManager.getPriorityContacts();
 
+        // First, always send an SMS to all priority contacts.
+        // This runs immediately, whether online or offline.
+        if (priorityContacts != null && !priorityContacts.isEmpty()) {
+            for (Contact contact : priorityContacts) {
+                if (contact.getPhoneNumber() != null && !contact.getPhoneNumber().isEmpty()) {
+                    sendSmsAlert(contact.getPhoneNumber(), location);
+                }
+            }
+        } else {
+            Log.w(TAG, "No priority contacts set. Cannot send SMS alerts.");
+        }
+
         if (isOnline()) {
             Log.d(TAG, "Device is ONLINE. Executing advanced plan.");
-            // 1. Send SMS as a backup
-            sendSmsToAll(priorityContacts, location);
 
-            // 2. Send high-priority FCM alerts
+            // The SMS is already sent. Now, also send the in-app FCM alerts.
             sendFcmAlertsToAll(priorityContacts, location);
 
-            // 3. Smart Calling
+            // Smart Calling
             SharedPreferences settingsPrefs = getSharedPreferences(SETTINGS_PREFS_NAME, Context.MODE_PRIVATE);
             String callPreference = settingsPrefs.getString(KEY_CALL_PREFERENCE, "standard");
 
             if (CALL_PREF_WEBRTC.equals(callPreference) && primaryContact != null && primaryContact.getUid() != null) {
                 Log.d(TAG, "Starting WebRTC call.");
-                // Primary contact must be an in-app user for WebRTC to work
                 startWebRtcCall(primaryContact.getUid());
             } else {
                 Log.d(TAG, "Making standard phone call as per preference or fallback.");
                 makeStandardPhoneCall(primaryContact);
-                stopSelf(); // Stop service after initiating the call
+                stopSelf();
             }
         } else {
             Log.d(TAG, "Device is OFFLINE. Executing fallback plan.");
-            // Offline: Just SMS and a standard call
-            sendSmsToAll(priorityContacts, location);
+            // The SMS is already sent. Now just make the standard call.
             makeStandardPhoneCall(primaryContact);
             stopSelf();
         }
@@ -119,19 +128,11 @@ public class EmergencyHandlerService extends Service implements WebRTCManager.We
 
     private void startWebRtcCall(String targetUid) {
         webRTCManager.startCall(targetUid);
-        // The service will remain running until the WebRTC call is established or fails.
-        // It will be stopped by the onWebRTCCallEnded or onWebRTCCallEstablished callbacks.
     }
 
-    private void sendSmsToAll(List<Contact> contacts, Location location) {
-        if (contacts != null && !contacts.isEmpty()) {
-            for (Contact contact : contacts) {
-                sendSmsAlert(contact.getPhoneNumber(), location);
-            }
-        } else {
-            Log.w(TAG, "No priority contacts set. Cannot send SMS alerts.");
-        }
-    }
+    // --- THIS METHOD IS NO LONGER NEEDED AND HAS BEEN REMOVED ---
+    // private void sendSmsToAll(...) { ... }
+
 
     private void sendFcmAlertsToAll(List<Contact> contacts, Location location) {
         FirebaseUser currentUser = FirebaseAuth.getInstance().getCurrentUser();
@@ -156,7 +157,6 @@ public class EmergencyHandlerService extends Service implements WebRTCManager.We
     }
 
     private void sendFcmMessage(String recipientUid, String callerName, String callerUid, Location location) {
-        // We need the recipient's FCM token, which should be stored in their user document
         FirebaseFirestore.getInstance().collection("users").document(recipientUid).get()
             .addOnCompleteListener(new OnCompleteListener<DocumentSnapshot>() {
                 @Override
@@ -174,7 +174,6 @@ public class EmergencyHandlerService extends Service implements WebRTCManager.We
                                 messageBuilder.addData("location", location.getLatitude() + "," + location.getLongitude());
                             }
 
-                            // If a WebRTC call is being initiated, include the session ID
                             if (webRTCManager != null && webRTCManager.getSignalingClient().getSessionId() != null) {
                                 messageBuilder.addData("sessionId", webRTCManager.getSignalingClient().getSessionId());
                             }
@@ -202,8 +201,9 @@ public class EmergencyHandlerService extends Service implements WebRTCManager.We
         }
     }
 
+    // --- THIS IS THE RESTORED SMS METHOD FROM YOUR OLD APP ---
     private void sendSmsAlert(String phoneNumber, Location location) {
-        if (phoneNumber == null || phoneNumber.isEmpty()) {
+        if (phoneNumber == null || phoneNumber.isEmpty() || phoneNumber.equals("No number provided")) {
             Log.e(TAG, "Phone number is invalid for SMS.");
             return;
         }
@@ -261,4 +261,4 @@ public class EmergencyHandlerService extends Service implements WebRTCManager.We
         Log.i(TAG, "WebRTC call ended or failed. Stopping service.");
         stopSelf();
     }
-} 
+}
