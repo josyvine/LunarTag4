@@ -4,6 +4,7 @@ import android.Manifest;
 import android.app.Service;
 import android.content.Context;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.location.Location;
 import android.net.ConnectivityManager;
@@ -14,33 +15,41 @@ import android.telephony.SmsManager;
 import android.util.Log;
 import android.widget.Toast;
 
+import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 import androidx.core.content.ContextCompat;
 
+import com.google.android.gms.tasks.OnCompleteListener;
+import com.google.android.gms.tasks.Task;
 import com.google.firebase.auth.FirebaseAuth;
 import com.google.firebase.auth.FirebaseUser;
+import com.google.firebase.firestore.DocumentSnapshot;
+import com.google.firebase.firestore.FirebaseFirestore;
+import com.google.firebase.messaging.FirebaseMessaging;
+import com.google.firebase.messaging.RemoteMessage;
 import com.safevoice.app.models.Contact;
 import com.safevoice.app.utils.ContactsManager;
 import com.safevoice.app.utils.LocationHelper;
+import com.safevoice.app.webrtc.WebRTCManager;
 
 import java.util.ArrayList;
 import java.util.List;
 
-/**
- * This service is responsible for handling the emergency alert logic.
- * It is started by VoiceRecognitionService upon detecting the trigger phrase.
- * It fetches the location, checks network connectivity, and dispatches alerts.
- */
-public class EmergencyHandlerService extends Service {
+public class EmergencyHandlerService extends Service implements WebRTCManager.WebRTCListener {
 
     private static final String TAG = "EmergencyHandlerService";
+    private static final String SETTINGS_PREFS_NAME = "SafeVoiceSettingsPrefs";
+    private static final String KEY_CALL_PREFERENCE = "call_preference";
+    private static final String CALL_PREF_WEBRTC = "webrtc";
 
     private LocationHelper locationHelper;
+    private WebRTCManager webRTCManager;
 
     @Override
     public void onCreate() {
         super.onCreate();
         locationHelper = new LocationHelper(this);
+        webRTCManager = new WebRTCManager(getApplicationContext(), this);
     }
 
     @Override
@@ -57,115 +66,156 @@ public class EmergencyHandlerService extends Service {
         locationHelper.getCurrentLocation(new LocationHelper.LocationResultCallback() {
             @Override
             public void onLocationResult(Location location) {
-                if (location != null) {
-                    Log.d(TAG, "Location acquired: " + location.getLatitude() + ", " + location.getLongitude());
-                    executeEmergencyActions(location);
-                } else {
-                    Log.e(TAG, "Failed to acquire location. Sending alerts without it.");
-                    executeEmergencyActions(null);
-                }
-                stopSelf();
+                executeEmergencyActions(location);
+                // The service will stop itself after actions are complete
             }
         });
 
         return START_NOT_STICKY;
     }
 
-    /**
-     * Executes the main emergency logic (calling, sending SMS) based on network state.
-     *
-     * @param location The user's current location. Can be null if fetching failed.
-     */
     private void executeEmergencyActions(Location location) {
-        // --- THIS IS THE FIX ---
-        // Get the singleton instance of the ContactsManager.
         ContactsManager contactsManager = ContactsManager.getInstance(this);
-
-        // Retrieve the saved contacts instead of using hardcoded placeholders.
         Contact primaryContact = contactsManager.getPrimaryContact();
         List<Contact> priorityContacts = contactsManager.getPriorityContacts();
 
-        // Make the primary phone call.
+        if (isOnline()) {
+            Log.d(TAG, "Device is ONLINE. Executing advanced plan.");
+            // 1. Send SMS as a backup
+            sendSmsToAll(priorityContacts, location);
+
+            // 2. Send high-priority FCM alerts
+            sendFcmAlertsToAll(priorityContacts, location);
+
+            // 3. Smart Calling
+            SharedPreferences settingsPrefs = getSharedPreferences(SETTINGS_PREFS_NAME, Context.MODE_PRIVATE);
+            String callPreference = settingsPrefs.getString(KEY_CALL_PREFERENCE, "standard");
+
+            if (CALL_PREF_WEBRTC.equals(callPreference) && primaryContact != null && primaryContact.getUid() != null) {
+                Log.d(TAG, "Starting WebRTC call.");
+                // Primary contact must be an in-app user for WebRTC to work
+                startWebRtcCall(primaryContact.getUid());
+            } else {
+                Log.d(TAG, "Making standard phone call as per preference or fallback.");
+                makeStandardPhoneCall(primaryContact);
+                stopSelf(); // Stop service after initiating the call
+            }
+        } else {
+            Log.d(TAG, "Device is OFFLINE. Executing fallback plan.");
+            // Offline: Just SMS and a standard call
+            sendSmsToAll(priorityContacts, location);
+            makeStandardPhoneCall(primaryContact);
+            stopSelf();
+        }
+    }
+
+    private void makeStandardPhoneCall(Contact primaryContact) {
         if (primaryContact != null) {
             makePhoneCall(primaryContact.getPhoneNumber());
         } else {
             Log.w(TAG, "No primary contact set. Cannot make emergency call.");
         }
+    }
 
-        // Check for internet connectivity (though SMS doesn't strictly need it, it's good practice).
-        if (isOnline()) {
-            Log.d(TAG, "Device is online. Sending SMS alerts.");
-            // Send SMS alerts to all priority contacts.
-            if (priorityContacts != null && !priorityContacts.isEmpty()) {
-                for (Contact contact : priorityContacts) {
-                    sendSmsAlert(contact.getPhoneNumber(), location);
-                }
-            } else {
-                Log.w(TAG, "No priority contacts set. Cannot send SMS alerts.");
+    private void startWebRtcCall(String targetUid) {
+        webRTCManager.startCall(targetUid);
+        // The service will remain running until the WebRTC call is established or fails.
+        // It will be stopped by the onWebRTCCallEnded or onWebRTCCallEstablished callbacks.
+    }
+
+    private void sendSmsToAll(List<Contact> contacts, Location location) {
+        if (contacts != null && !contacts.isEmpty()) {
+            for (Contact contact : contacts) {
+                sendSmsAlert(contact.getPhoneNumber(), location);
             }
         } else {
-            Log.d(TAG, "Device is offline. Only primary phone call was made.");
+            Log.w(TAG, "No priority contacts set. Cannot send SMS alerts.");
         }
     }
 
-    /**
-     * Initiates a direct phone call to the specified number.
-     *
-     * @param phoneNumber The number to call.
-     */
+    private void sendFcmAlertsToAll(List<Contact> contacts, Location location) {
+        FirebaseUser currentUser = FirebaseAuth.getInstance().getCurrentUser();
+        if (currentUser == null) return;
+
+        FirebaseFirestore.getInstance().collection("users").document(currentUser.getUid()).get()
+            .addOnCompleteListener(new OnCompleteListener<DocumentSnapshot>() {
+                @Override
+                public void onComplete(@NonNull Task<DocumentSnapshot> task) {
+                    if (task.isSuccessful() && task.getResult() != null) {
+                        String callerName = task.getResult().getString("verifiedName");
+                        if (callerName == null) callerName = currentUser.getDisplayName();
+
+                        for (Contact contact : contacts) {
+                            if (contact.getUid() != null) {
+                                sendFcmMessage(contact.getUid(), callerName, currentUser.getUid(), location);
+                            }
+                        }
+                    }
+                }
+            });
+    }
+
+    private void sendFcmMessage(String recipientUid, String callerName, String callerUid, Location location) {
+        // We need the recipient's FCM token, which should be stored in their user document
+        FirebaseFirestore.getInstance().collection("users").document(recipientUid).get()
+            .addOnCompleteListener(new OnCompleteListener<DocumentSnapshot>() {
+                @Override
+                public void onComplete(@NonNull Task<DocumentSnapshot> task) {
+                    if (task.isSuccessful() && task.getResult() != null) {
+                        String fcmToken = task.getResult().getString("fcmToken");
+                        if (fcmToken != null) {
+                            RemoteMessage.Builder messageBuilder = new RemoteMessage.Builder(fcmToken)
+                                    .setMessageId(Integer.toString(java.util.UUID.randomUUID().hashCode()))
+                                    .addData("type", "emergency")
+                                    .addData("callerName", callerName)
+                                    .addData("callerUid", callerUid);
+
+                            if (location != null) {
+                                messageBuilder.addData("location", location.getLatitude() + "," + location.getLongitude());
+                            }
+
+                            // If a WebRTC call is being initiated, include the session ID
+                            if (webRTCManager != null && webRTCManager.getSignalingClient().getSessionId() != null) {
+                                messageBuilder.addData("sessionId", webRTCManager.getSignalingClient().getSessionId());
+                            }
+
+                            FirebaseMessaging.getInstance().send(messageBuilder.build());
+                            Log.d(TAG, "Sent FCM alert to " + recipientUid);
+                        }
+                    }
+                }
+            });
+    }
+
     private void makePhoneCall(String phoneNumber) {
         if (phoneNumber == null || phoneNumber.isEmpty()) {
             Log.e(TAG, "Phone number is invalid. Cannot make call.");
             return;
         }
-
         Intent callIntent = new Intent(Intent.ACTION_CALL);
         callIntent.setData(Uri.parse("tel:" + phoneNumber));
         callIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-
         try {
-            Log.i(TAG, "Attempting to call " + phoneNumber);
             startActivity(callIntent);
         } catch (SecurityException e) {
-            Log.e(TAG, "SecurityException: CALL_PHONE permission might be missing or denied.", e);
-        } catch (Exception e) {
-            Log.e(TAG, "Failed to initiate phone call.", e);
+            Log.e(TAG, "CALL_PHONE permission missing or denied.", e);
         }
     }
 
-    /**
-     * Sends an SMS alert to the specified number.
-     *
-     * @param phoneNumber The number to send the SMS to.
-     * @param location    The user's location, used to generate a map link.
-     */
     private void sendSmsAlert(String phoneNumber, Location location) {
         if (phoneNumber == null || phoneNumber.isEmpty()) {
-            Log.e(TAG, "Priority contact phone number is invalid. Cannot send SMS.");
+            Log.e(TAG, "Phone number is invalid for SMS.");
             return;
         }
-        
-        // --- THIS IS THE FIX ---
-        // Get the user's name dynamically for a personalized message.
         FirebaseUser currentUser = FirebaseAuth.getInstance().getCurrentUser();
-        String userName = "the user"; // Default name
-        if (currentUser != null && currentUser.getDisplayName() != null && !currentUser.getDisplayName().isEmpty()) {
-            // We use the Google display name. In a more advanced version,
-            // you would fetch the "verifiedName" from Firestore.
-            userName = currentUser.getDisplayName();
-        }
-
-        String message = "EMERGENCY: This is an automated alert from Safe Voice for " + userName + ". They may be in trouble.";
-
+        String userName = (currentUser != null && currentUser.getDisplayName() != null) ? currentUser.getDisplayName() : "a Safe Voice user";
+        String message = "EMERGENCY: Automated alert from Safe Voice for " + userName + ". They may be in trouble.";
         if (location != null) {
-            String mapLink = "https://maps.google.com/?q=" + location.getLatitude() + "," + location.getLongitude();
-            message += "\n\nTheir last known location is:\n" + mapLink;
+            message += "\n\nLast known location: https://maps.google.com/?q=" + location.getLatitude() + "," + location.getLongitude();
         }
-
         try {
             SmsManager smsManager = SmsManager.getDefault();
-            ArrayList<String> messageParts = smsManager.divideMessage(message);
-            smsManager.sendMultipartTextMessage(phoneNumber, null, messageParts, null, null);
+            smsManager.sendMultipartTextMessage(phoneNumber, null, smsManager.divideMessage(message), null, null);
             Log.i(TAG, "SMS alert sent to " + phoneNumber);
         } catch (Exception e) {
             Log.e(TAG, "Failed to send SMS to " + phoneNumber, e);
@@ -174,7 +224,6 @@ public class EmergencyHandlerService extends Service {
 
     private boolean isOnline() {
         ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
-        if (cm == null) return false;
         NetworkInfo netInfo = cm.getActiveNetworkInfo();
         return netInfo != null && netInfo.isConnectedOrConnecting();
     }
@@ -189,5 +238,27 @@ public class EmergencyHandlerService extends Service {
     @Override
     public IBinder onBind(Intent intent) {
         return null;
+    }
+
+    @Override
+    public void onDestroy() {
+        super.onDestroy();
+        if (webRTCManager != null) {
+            webRTCManager.cleanup();
+        }
+        Log.d(TAG, "EmergencyHandlerService destroyed.");
+    }
+
+    // WebRTCManager.WebRTCListener callbacks
+    @Override
+    public void onWebRTCCallEstablished() {
+        Log.i(TAG, "WebRTC call established. Stopping service.");
+        stopSelf();
+    }
+
+    @Override
+    public void onWebRTCCallEnded() {
+        Log.i(TAG, "WebRTC call ended or failed. Stopping service.");
+        stopSelf();
     }
 }
