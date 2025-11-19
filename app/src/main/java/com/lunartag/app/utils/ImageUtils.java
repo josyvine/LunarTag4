@@ -13,21 +13,16 @@ import java.io.ByteArrayOutputStream;
 import java.nio.ByteBuffer;
 
 /**
- * A utility class with static methods for image processing,
- * particularly for converting CameraX ImageProxy objects to Bitmaps
- * and handling rotation.
+ * A utility class with static methods for image processing.
+ * UPDATED: Includes robust handling for Hardware RowStrides (Padding) to prevent corruption.
  */
 public class ImageUtils {
 
-    // Private constructor to prevent instantiation of this utility class.
     private ImageUtils() {}
 
     /**
-     * Converts an ImageProxy object (typically in YUV_420_888 format) to a Bitmap,
-     * correcting for the rotation of the camera sensor.
-     *
-     * @param imageProxy The ImageProxy from the camera.
-     * @return A Bitmap representation of the image, correctly rotated.
+     * Robust conversion of ImageProxy to Bitmap.
+     * Handles JPEG, YUV_420_888, and Hardware Padding correctly.
      */
     public static Bitmap imageProxyToBitmap(ImageProxy imageProxy) {
         if (imageProxy == null || imageProxy.getImage() == null) {
@@ -35,64 +30,141 @@ public class ImageUtils {
         }
 
         Image image = imageProxy.getImage();
-        
-        // 1. Convert YUV to Byte Array
-        byte[] bytes = yuv420toJpeg(image);
-        if (bytes == null) {
+        Bitmap bitmap = null;
+
+        // 1. Try to Extract Bitmap based on Format
+        if (image.getFormat() == ImageFormat.JPEG) {
+            // Handle JPEG directly
+            ByteBuffer buffer = image.getPlanes()[0].getBuffer();
+            buffer.rewind(); // CRITICAL: Reset buffer position before reading
+            byte[] bytes = new byte[buffer.remaining()];
+            buffer.get(bytes);
+            bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.length);
+        } 
+        else if (image.getFormat() == ImageFormat.YUV_420_888) {
+            // Handle YUV with strict padding calculations
+            byte[] nv21 = yuv420ToNv21(image);
+            if (nv21 != null) {
+                YuvImage yuvImage = new YuvImage(nv21, ImageFormat.NV21, image.getWidth(), image.getHeight(), null);
+                ByteArrayOutputStream out = new ByteArrayOutputStream();
+                yuvImage.compressToJpeg(new Rect(0, 0, yuvImage.getWidth(), yuvImage.getHeight()), 100, out);
+                byte[] imageBytes = out.toByteArray();
+                bitmap = BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.length);
+            }
+        }
+
+        if (bitmap == null) {
             return null;
         }
 
-        // 2. Decode Byte Array to Bitmap
-        Bitmap bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.length);
-
-        // 3. Handle Rotation (CRITICAL FOR FRONT CAMERA)
-        // CameraX provides the rotation degrees needed to make the image upright.
+        // 2. Handle Rotation
         int rotationDegrees = imageProxy.getImageInfo().getRotationDegrees();
-        
         if (rotationDegrees != 0) {
             Matrix matrix = new Matrix();
             matrix.postRotate(rotationDegrees);
-            // Re-create the bitmap with the rotation applied
-            Bitmap rotatedBitmap = Bitmap.createBitmap(
+            Bitmap rotated = Bitmap.createBitmap(
                     bitmap, 0, 0, bitmap.getWidth(), bitmap.getHeight(), matrix, true
             );
-            // Recycle the old bitmap to save memory
-            if (rotatedBitmap != bitmap) {
+            if (rotated != bitmap) {
                 bitmap.recycle();
             }
-            return rotatedBitmap;
+            return rotated;
         }
 
         return bitmap;
     }
 
     /**
-     * Helper to convert YUV_420_888 image to JPEG byte array.
+     * Highly Robust YUV_420_888 to NV21 Converter.
+     * Skips the 'Padding' bytes that cause corruption on Oppo/Vivo/Samsung devices.
      */
-    private static byte[] yuv420toJpeg(Image image) {
-        if (image.getFormat() != ImageFormat.YUV_420_888) {
-            // Fallback for other formats if needed
-            return null; 
-        }
-
+    private static byte[] yuv420ToNv21(Image image) {
+        int width = image.getWidth();
+        int height = image.getHeight();
+        
         ByteBuffer yBuffer = image.getPlanes()[0].getBuffer();
         ByteBuffer uBuffer = image.getPlanes()[1].getBuffer();
         ByteBuffer vBuffer = image.getPlanes()[2].getBuffer();
 
-        int ySize = yBuffer.remaining();
-        int uSize = uBuffer.remaining();
-        int vSize = vBuffer.remaining();
+        int rowStride = image.getPlanes()[0].getRowStride();
+        int pixelStride = image.getPlanes()[0].getPixelStride(); // Usually 1 for Y
 
-        byte[] nv21 = new byte[ySize + uSize + vSize];
+        int pos = 0;
+        byte[] nv21 = new byte[width * height + (width * height / 2)];
 
-        // U and V are swapped
-        yBuffer.get(nv21, 0, ySize);
-        vBuffer.get(nv21, ySize, vSize);
-        uBuffer.get(nv21, ySize + vSize, uSize);
+        // --- 1. Copy Y Channel (Luminance) ---
+        // If rowStride == width, we can copy everything at once.
+        // If rowStride > width, we must copy row-by-row to skip padding.
+        if (rowStride == width) {
+            yBuffer.get(nv21, 0, width * height);
+            pos = width * height;
+        } else {
+            // Complex copy for hardware with padding
+            int yBufferPos = width * height; // Approximate check
+            yBuffer.rewind();
+            for (int row = 0; row < height; row++) {
+                // Be careful with buffer limits
+                int length = Math.min(width, yBuffer.remaining());
+                yBuffer.get(nv21, pos, length);
+                pos += width;
+                
+                // Skip the padding bytes at end of row
+                if (row < height - 1) {
+                    int padding = rowStride - width;
+                    if (yBuffer.remaining() >= padding) {
+                         // Manually advance buffer position
+                         yBuffer.position(yBuffer.position() + padding);
+                    }
+                }
+            }
+        }
 
-        YuvImage yuvImage = new YuvImage(nv21, ImageFormat.NV21, image.getWidth(), image.getHeight(), null);
-        ByteArrayOutputStream out = new ByteArrayOutputStream();
-        yuvImage.compressToJpeg(new Rect(0, 0, yuvImage.getWidth(), yuvImage.getHeight()), 100, out);
-        return out.toByteArray();
+        // --- 2. Copy U and V Channels (Chrominance) Interleaved ---
+        int rowStrideUV = image.getPlanes()[1].getRowStride();
+        int pixelStrideUV = image.getPlanes()[1].getPixelStride();
+        
+        // Fallback mechanism if conversion is too complex for standard copy
+        // Just trying to be safe for your specific crash
+        try {
+            // Simplified NV21 packing
+            // V first, then U (NV21 standard)
+            // Note: Usually UV planes are subsampled (width/2, height/2)
+            
+            // Reset buffers
+            uBuffer.rewind();
+            vBuffer.rewind();
+            
+            int uvHeight = height / 2;
+            int uvWidth = width / 2;
+            
+            // We are writing to nv21[pos]
+            // NV21 format expects: V, U, V, U...
+            
+            // The safest generic way is to pull bytes individually if we suspect strides
+            byte[] vBytes = new byte[vBuffer.remaining()];
+            vBuffer.get(vBytes);
+            
+            byte[] uBytes = new byte[uBuffer.remaining()];
+            uBuffer.get(uBytes);
+
+            for (int row = 0; row < uvHeight; row++) {
+                for (int col = 0; col < uvWidth; col++) {
+                     // Calculate source index with strides
+                     int vIndex = (row * rowStrideUV) + (col * pixelStrideUV);
+                     int uIndex = (row * rowStrideUV) + (col * pixelStrideUV);
+                     
+                     if (vIndex < vBytes.length && uIndex < uBytes.length && pos < nv21.length - 1) {
+                         nv21[pos++] = vBytes[vIndex]; // V
+                         nv21[pos++] = uBytes[uIndex]; // U
+                     }
+                }
+            }
+
+        } catch (Exception e) {
+            // If precise conversion fails, return null to trigger the outer error
+            return null;
+        }
+
+        return nv21;
     }
-} 
+}
