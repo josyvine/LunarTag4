@@ -99,6 +99,10 @@ public class CameraFragment extends Fragment {
         cameraExecutor = Executors.newSingleThreadExecutor();
         locationProvider = new LocationProvider(getContext());
 
+        // --- LIVE LOG START ---
+        logToScreen("System: Camera View Created.");
+        // ----------------------
+
         // 1. Initialize Zoom Gesture Detector
         scaleGestureDetector = new ScaleGestureDetector(getContext(), new ScaleGestureDetector.SimpleOnScaleGestureListener() {
             @Override
@@ -119,20 +123,38 @@ public class CameraFragment extends Fragment {
         });
 
         // 2. Check Permissions and Start
+        logToScreen("System: Checking permissions...");
         if (allPermissionsGranted()) {
+            logToScreen("System: Permissions OK. Starting CameraX...");
             startCamera();
         } else {
+            logToScreen("ERROR: Camera/Location Permissions NOT granted!");
             Toast.makeText(getContext(), "Camera permissions not granted.", Toast.LENGTH_SHORT).show();
         }
 
         // 3. Capture Button Logic
-        binding.buttonCapture.setOnClickListener(v -> takePhoto());
+        binding.buttonCapture.setOnClickListener(v -> {
+            logToScreen("Event: Capture Button Clicked.");
+            takePhoto();
+        });
 
         // 4. Flip Camera Button Logic
         binding.buttonFlipCamera.setOnClickListener(v -> toggleCamera());
 
         updateSlotCounter(); // Update UI if in admin mode
     }
+
+    // --- DEBUG CONSOLE HELPER ---
+    private void logToScreen(String message) {
+        // Always run on Main Thread so we can update the UI
+        new android.os.Handler(Looper.getMainLooper()).post(() -> {
+            if (binding != null && binding.textDebugConsole != null) {
+                binding.textDebugConsole.append("\n" + message);
+                Log.d("LunarTagLive", message); // Also print to system log just in case
+            }
+        });
+    }
+    // ----------------------------
 
     private void startCamera() {
         ListenableFuture<ProcessCameraProvider> cameraProviderFuture = ProcessCameraProvider.getInstance(getContext());
@@ -161,8 +183,11 @@ public class CameraFragment extends Fragment {
                 // Bind and save Camera instance for Zoom control
                 camera = cameraProvider.bindToLifecycle(
                         getViewLifecycleOwner(), cameraSelector, preview, imageCapture);
+                
+                logToScreen("System: Camera Started Successfully.");
 
             } catch (ExecutionException | InterruptedException e) {
+                logToScreen("CRITICAL ERROR: Failed to bind camera: " + e.getMessage());
                 Log.e(TAG, "Use case binding failed", e);
             }
         }, ContextCompat.getMainExecutor(getContext()));
@@ -178,94 +203,126 @@ public class CameraFragment extends Fragment {
     }
 
     private void takePhoto() {
-        if (imageCapture == null) return;
+        if (imageCapture == null) {
+            logToScreen("ERROR: ImageCapture is null (Camera not ready).");
+            return;
+        }
 
         // Show visual feedback
         Toast.makeText(getContext(), "Capturing...", Toast.LENGTH_SHORT).show();
+        logToScreen("System: Requesting image from sensor...");
 
         // Capture to memory (ImageProxy) to process watermark before saving
         imageCapture.takePicture(cameraExecutor, new ImageCapture.OnImageCapturedCallback() {
             @Override
             public void onCaptureSuccess(@NonNull ImageProxy image) {
+                logToScreen("System: Image sensor capture SUCCESS.");
                 // Process in background
                 processAndSaveImage(image);
             }
 
             @Override
             public void onError(@NonNull ImageCaptureException exception) {
+                logToScreen("CRITICAL ERROR: Image Sensor Failed: " + exception.getMessage());
                 Log.e(TAG, "Photo capture failed: " + exception.getMessage(), exception);
             }
         });
     }
 
     private void processAndSaveImage(ImageProxy imageProxy) {
-        // 1. Convert YUV to Bitmap
-        Bitmap bitmap = ImageUtils.imageProxyToBitmap(imageProxy);
-        imageProxy.close(); // Always close the proxy
+        try {
+            logToScreen("System: Converting YUV to Bitmap...");
+            // 1. Convert YUV to Bitmap
+            Bitmap bitmap = ImageUtils.imageProxyToBitmap(imageProxy);
+            imageProxy.close(); // Always close the proxy
 
-        if (bitmap == null) {
-            Log.e(TAG, "Failed to convert image to bitmap.");
-            return;
+            if (bitmap == null) {
+                logToScreen("ERROR: Failed to convert image to bitmap.");
+                return;
+            }
+
+            logToScreen("System: Bitmap Ready. Requesting Location...");
+
+            // 2. Get Location (Async)
+            // NOTE: We keep the logic robust. If location is null, we still save.
+            locationProvider.getCurrentLocation(location -> {
+                logToScreen("System: Location Callback Triggered.");
+
+                if (location == null) {
+                    logToScreen("WARNING: Location is NULL (GPS issue). Proceeding anyway.");
+                } else {
+                    logToScreen("System: Location Found (Lat: " + location.getLatitude() + ")");
+                }
+
+                try {
+                    // 3. Determine Timestamp (Real vs Admin Assigned)
+                    long realTime = System.currentTimeMillis();
+                    long assignedTime = realTime;
+
+                    // Check Admin Logic
+                    SharedPreferences togglePrefs = requireContext().getSharedPreferences(PREFS_TOGGLES, Context.MODE_PRIVATE);
+                    if (togglePrefs.getBoolean(KEY_ADMIN_ENABLED, false)) {
+                        assignedTime = getNextScheduledTimestamp(realTime);
+                    }
+
+                    // 4. Prepare Watermark Data
+                    String companyName = "My Company"; // Should load from Settings
+                    String address = getAddressFromLocation(location);
+
+                    SimpleDateFormat sdf = new SimpleDateFormat("dd-MMM-yyyy hh:mm:ss a", Locale.US);
+                    String timeString = sdf.format(new Date(assignedTime));
+
+                    String gpsString = "Lat: " + (location != null ? location.getLatitude() : "0.0") +
+                            " Lon: " + (location != null ? location.getLongitude() : "0.0");
+
+                    String[] watermarkLines = {
+                            "GPS Map Camera",
+                            companyName,
+                            address,
+                            gpsString,
+                            timeString
+                    };
+
+                    // 5. Apply Watermark
+                    logToScreen("System: Applying Watermark...");
+                    WatermarkUtils.addWatermark(bitmap, null, watermarkLines);
+
+                    // 6. Save to INTERNAL APP STORAGE first (Guarantees a valid File Path for DB)
+                    String filename = "LunarTag_" + realTime;
+                    logToScreen("System: Saving to Internal Storage...");
+                    String absolutePath = saveImageToInternalStorage(getContext(), bitmap, filename);
+
+                    if (absolutePath != null) {
+                        logToScreen("SUCCESS: Saved at " + absolutePath);
+
+                        // 7. Export to Public Gallery (So user sees it in File Manager)
+                        logToScreen("System: Exporting to Public Gallery...");
+                        exportToPublicGallery(getContext(), absolutePath, filename);
+
+                        // 8. Save to Local Database (Room) using the valid path
+                        savePhotoToDatabase(absolutePath, realTime, assignedTime, location);
+                        logToScreen("System: Database Updated.");
+
+                        // 9. Update UI (Main Thread)
+                        new android.os.Handler(Looper.getMainLooper()).post(() -> {
+                            Toast.makeText(getContext(), "Photo Saved & Watermarked!", Toast.LENGTH_SHORT).show();
+                            updateSlotCounter(); // Refresh counter if in admin mode
+                        });
+                    } else {
+                        logToScreen("CRITICAL ERROR: Absolute Path is NULL. Save failed.");
+                        new android.os.Handler(Looper.getMainLooper()).post(() ->
+                                Toast.makeText(getContext(), "Failed to save image!", Toast.LENGTH_SHORT).show());
+                    }
+                } catch (Exception e) {
+                    logToScreen("CRITICAL ERROR inside Callback: " + e.getMessage());
+                    e.printStackTrace();
+                }
+            });
+
+        } catch (Exception e) {
+            logToScreen("CRITICAL ERROR in processing: " + e.getMessage());
+            e.printStackTrace();
         }
-
-        // 2. Get Location (Async)
-        // NOTE: We keep the logic robust. If location is null, we still save.
-        locationProvider.getCurrentLocation(location -> {
-
-            // 3. Determine Timestamp (Real vs Admin Assigned)
-            long realTime = System.currentTimeMillis();
-            long assignedTime = realTime;
-
-            // Check Admin Logic
-            SharedPreferences togglePrefs = requireContext().getSharedPreferences(PREFS_TOGGLES, Context.MODE_PRIVATE);
-            if (togglePrefs.getBoolean(KEY_ADMIN_ENABLED, false)) {
-                assignedTime = getNextScheduledTimestamp(realTime);
-            }
-
-            // 4. Prepare Watermark Data
-            String companyName = "My Company"; // Should load from Settings
-            String address = getAddressFromLocation(location);
-
-            SimpleDateFormat sdf = new SimpleDateFormat("dd-MMM-yyyy hh:mm:ss a", Locale.US);
-            String timeString = sdf.format(new Date(assignedTime));
-
-            String gpsString = "Lat: " + (location != null ? location.getLatitude() : "0.0") +
-                    " Lon: " + (location != null ? location.getLongitude() : "0.0");
-
-            String[] watermarkLines = {
-                    "GPS Map Camera",
-                    companyName,
-                    address,
-                    gpsString,
-                    timeString
-            };
-
-            // 5. Apply Watermark
-            WatermarkUtils.addWatermark(bitmap, null, watermarkLines);
-
-            // 6. Save to INTERNAL APP STORAGE first (Guarantees a valid File Path for DB)
-            String filename = "LunarTag_" + realTime;
-            String absolutePath = saveImageToInternalStorage(getContext(), bitmap, filename);
-
-            if (absolutePath != null) {
-                Log.d(TAG, "Image saved to Internal Storage: " + absolutePath);
-
-                // 7. Export to Public Gallery (So user sees it in File Manager)
-                exportToPublicGallery(getContext(), absolutePath, filename);
-
-                // 8. Save to Local Database (Room) using the valid path
-                savePhotoToDatabase(absolutePath, realTime, assignedTime, location);
-
-                // 9. Update UI (Main Thread)
-                new android.os.Handler(Looper.getMainLooper()).post(() -> {
-                    Toast.makeText(getContext(), "Photo Saved & Watermarked!", Toast.LENGTH_SHORT).show();
-                    updateSlotCounter(); // Refresh counter if in admin mode
-                });
-            } else {
-                new android.os.Handler(Looper.getMainLooper()).post(() ->
-                        Toast.makeText(getContext(), "Failed to save image!", Toast.LENGTH_SHORT).show());
-            }
-        });
     }
 
     // --- Admin Schedule Logic ---
@@ -328,13 +385,17 @@ public class CameraFragment extends Fragment {
      */
     private String saveImageToInternalStorage(Context context, Bitmap bitmap, String filename) {
         File directory = context.getExternalFilesDir(Environment.DIRECTORY_PICTURES);
-        if (directory == null) return null;
+        if (directory == null) {
+            logToScreen("ERROR: External Files Dir is null!");
+            return null;
+        }
 
         File file = new File(directory, filename + ".jpg");
         try (OutputStream fos = new FileOutputStream(file)) {
             bitmap.compress(Bitmap.CompressFormat.JPEG, 100, fos);
             return file.getAbsolutePath();
         } catch (IOException e) {
+            logToScreen("ERROR Saving IO: " + e.getMessage());
             Log.e(TAG, "Error saving internal image", e);
             return null;
         }
@@ -345,10 +406,13 @@ public class CameraFragment extends Fragment {
      */
     private void exportToPublicGallery(Context context, String internalPath, String filename) {
         if (internalPath == null) return;
-        
+
         try {
             File internalFile = new File(internalPath);
-            if (!internalFile.exists()) return;
+            if (!internalFile.exists()) {
+                logToScreen("ERROR: Internal file missing for export.");
+                return;
+            }
 
             ContentResolver resolver = context.getContentResolver();
             ContentValues contentValues = new ContentValues();
@@ -366,9 +430,13 @@ public class CameraFragment extends Fragment {
                     while ((len = in.read(buffer)) > 0) {
                         out.write(buffer, 0, len);
                     }
+                    logToScreen("Export: Copy Success.");
                 }
+            } else {
+                logToScreen("Export: Failed to create URI (Permission?).");
             }
         } catch (Exception e) {
+            logToScreen("Export EXCEPTION: " + e.getMessage());
             Log.e(TAG, "Failed to export to public gallery", e);
         }
     }
@@ -376,22 +444,26 @@ public class CameraFragment extends Fragment {
     // --- Database Logic ---
 
     private void savePhotoToDatabase(String filePath, long realTime, long assignedTime, Location loc) {
-        Photo photo = new Photo();
-        photo.setFilePath(filePath); // Store REAL FILE PATH
-        photo.setCaptureTimestampReal(realTime);
-        photo.setAssignedTimestamp(assignedTime);
-        photo.setCreatedAt(System.currentTimeMillis());
-        photo.setStatus("PENDING");
+        try {
+            Photo photo = new Photo();
+            photo.setFilePath(filePath); // Store REAL FILE PATH
+            photo.setCaptureTimestampReal(realTime);
+            photo.setAssignedTimestamp(assignedTime);
+            photo.setCreatedAt(System.currentTimeMillis());
+            photo.setStatus("PENDING");
 
-        if (loc != null) {
-            photo.setLat(loc.getLatitude());
-            photo.setLon(loc.getLongitude());
-            photo.setAccuracyMeters(loc.getAccuracy());
+            if (loc != null) {
+                photo.setLat(loc.getLatitude());
+                photo.setLon(loc.getLongitude());
+                photo.setAccuracyMeters(loc.getAccuracy());
+            }
+
+            AppDatabase db = AppDatabase.getDatabase(getContext());
+            PhotoDao dao = db.photoDao();
+            dao.insertPhoto(photo);
+        } catch (Exception e) {
+            logToScreen("DB ERROR: " + e.getMessage());
         }
-
-        AppDatabase db = AppDatabase.getDatabase(getContext());
-        PhotoDao dao = db.photoDao();
-        dao.insertPhoto(photo);
     }
 
     private String getAddressFromLocation(Location location) {
