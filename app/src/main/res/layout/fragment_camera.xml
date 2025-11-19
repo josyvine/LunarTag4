@@ -119,20 +119,35 @@
             app:layout_constraintTop_toTopOf="parent"
             app:layout_constraintBottom_toBottomOf="parent"/>
 
+        <!-- Flip Camera Button (Right) - NEW ADDITION -->
+        <!-- Note: Using a standard android system icon for rotation if you don't have a custom one -->
+        <ImageButton
+            android:id="@+id/button_flip_camera"
+            android:layout_width="50dp"
+            android:layout_height="50dp"
+            android:src="@android:drawable/ic_menu_rotate"
+            android:scaleType="fitCenter"
+            android:background="?attr/selectableItemBackgroundBorderless"
+            android:contentDescription="Flip Camera"
+            app:tint="@android:color/white"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintTop_toTopOf="parent"
+            app:layout_constraintBottom_toBottomOf="parent"/>
 
-        <!-- Slot Counter (Right) -->
+        <!-- Slot Counter (Positioned above Flip Button) -->
         <TextView
             android:id="@+id/text_slot_counter"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:textColor="@android:color/white"
-            android:textSize="18sp"
+            android:textSize="14sp"
             android:textStyle="bold"
             android:visibility="gone"
-            app:layout_constraintEnd_toEndOf="parent"
-            app:layout_constraintTop_toTopOf="parent"
-            app:layout_constraintBottom_toBottomOf="parent"
-            tools:text="Slots: 5"
+            android:layout_marginBottom="8dp"
+            app:layout_constraintBottom_toTopOf="@id/button_flip_camera"
+            app:layout_constraintEnd_toEndOf="@id/button_flip_camera"
+            app:layout_constraintStart_toStartOf="@id/button_flip_camera"
+            tools:text="5 Slots"
             tools:visibility="visible"/>
 
     </androidx.constraintlayout.widget.ConstraintLayout>
