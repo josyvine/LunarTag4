@@ -52,6 +52,7 @@ import com.lunartag.app.utils.WatermarkUtils;
 import org.json.JSONArray;
 import org.json.JSONException;
 
+import java.io.File;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.text.SimpleDateFormat;
